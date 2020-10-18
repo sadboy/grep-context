@@ -87,6 +87,18 @@ used in that mode."
 		:value-type (choice string (const :tag "No separator" nil)))
   :group 'grep-context)
 
+(defcustom grep-context-line-regexp-alist
+  (list (cons 'grep-mode "%s[-=\0]%d[-=]"))
+  "Alist that associates major modes with context line patterns.
+Each value is a string passed to `format' to format a prefix
+regex for a context line. It should contain two %-sequences, for
+a filename and a line number, e.g. \"%s:%d:\".
+This is used to recognize existing formatted context lines from the output of
+`grep'-like tools."
+  :type '(alist :key-type (symbol :tag "Major mode")
+		:value-type string)
+  :group 'grep-context)
+
 (defcustom grep-context-default-format "%s:%d:"
   "Default format for context lines.
 Used if `grep-context-line-format-alist' contains no entry for current major
@@ -94,16 +106,35 @@ mode."
   :type '(choice string function)
   :group 'grep-context)
 
-(defcustom grep-context-mode-map
+(defcustom grep-context-line-default-regexp "%s[-=\0]%d[-=]"
+  "Default regexp for pre-existing context lines.
+Used if `grep-context-line-regexp-alist' contains no entry for current major
+mode."
+  :type 'string
+  :group 'grep-context)
+
+(defvar grep-context-mode-map
   (let ((map (make-keymap)))
     (define-key map "\+" #'grep-context-more-around-point)
     (define-key map "\-" #'grep-context-less-around-point)
+    (define-key map "e" (lambda () (interactive) (grep-context-more-around-point 4)))
+    (define-key map "c" (lambda () (interactive) (grep-context-less-around-point 4)))
     map)
-  "Keymap used in `grep-context-mode'."
-  :group 'grep-context)
+  "Keymap used in `grep-context-mode'.")
 
 (defvar-local grep-context--temp-file-buffer nil
   "A cell (file . buffer) where BUFFER is a buffer with contents of FILE.")
+
+(defconst grep-context--line-properties '(grep-context
+                                          grep-context-context-line
+                                          grep-context-separator)
+  "A complete list of text properties used by the package to
+  identify different types of lines.")
+
+(defun grep-context--is-line-propertized ()
+  ""
+  (let ((pos (point)))
+    (--some? (get-text-property pos it) grep-context--line-properties)))
 
 (defun grep-context-ag-format (_file line-number)
   "Formatter for context lines in `ag-mode'."
@@ -136,6 +167,48 @@ Return value is a cell (file . line)."
 	   (line (compilation--loc->line loc)))
       (cons file line))))
 
+(defun grep-context--get-separator ()
+  (cdr (assoc major-mode grep-context-separator-alist)))
+
+(defun grep-context--format-line-regexp (file)
+  (let ((regexp-format (or (cdr (assoc major-mode grep-context-line-regexp-alist))
+                           grep-context-line-default-regexp)))
+    (format (replace-regexp-in-string "%d" "[0-9]+" regexp-format)
+            (regexp-quote file))))
+
+(defun grep-context--process-context-lines (dir line-regexp)
+  (let ((step (cond
+               ((eq dir 'backward) -1)
+               ((eq dir 'forward) 1)
+               (t (error "Invalid direction"))))
+        (nlines 0))
+    (save-excursion
+      (goto-char (point-at-bol))
+      (forward-line step)
+      (while (and
+              (not (grep-context--is-line-propertized))
+              (looking-at-p line-regexp))
+        ;; Claim the context line:
+        (put-text-property (point-at-bol) (point-at-eol) 'grep-context-context-line t)
+        (cl-incf nlines)
+        (forward-line step))
+      ;; Claim the separator, if any:
+      (when (and (grep-context--get-separator)
+                 (not (grep-context--is-line-propertized))
+                 (looking-at-p (regexp-quote (grep-context--get-separator))))
+        (put-text-property (point-at-bol) (point-at-eol) 'grep-context-separator t)))
+    nlines))
+
+(defun grep-context--initialize-match ()
+  (-let* ((inhibit-read-only t)
+          ((file . _) (grep-context--match-location))
+          (line-regexp (grep-context--format-line-regexp file))
+          (ctx-before (grep-context--process-context-lines 'backward line-regexp))
+          (ctx-after (grep-context--process-context-lines 'forward line-regexp))
+          (cell (cons ctx-before ctx-after)))
+    (put-text-property (point-at-bol) (point-at-eol) 'grep-context cell)
+    cell))
+
 (defun grep-context--at-match (&optional n)
   "Get number of lines of context around match at point.
 If N is non-nil, call `grep-context--next-error' with N as argument first.
@@ -143,10 +216,14 @@ Return value is a cell (context-before . context-after) that can be modified."
   (save-excursion
     (grep-context--next-error (or n 0))
     (or (get-text-property (point) 'grep-context)
-	(let ((cell (cons 0 0))
-	      (inhibit-read-only t))
-	  (put-text-property (point-at-bol) (point-at-eol) 'grep-context cell)
-	  cell))))
+        (grep-context--initialize-match))))
+
+(defun grep-context--insert-separator ()
+  "Insert separator line at current point."
+  (beginning-of-line)
+  (open-line 1)
+  (insert (propertize (or (grep-context--get-separator) "--")
+                      'grep-context-separator t)))
 
 (defun grep-context--format-line (format file line-number line)
   (propertize (if (stringp format)
@@ -187,7 +264,6 @@ N defaults to 1."
 
 	  (format (or (cdr (assoc major-mode grep-context-line-format-alist))
 		      grep-context-default-format))
-	  (separator (cdr (assoc major-mode grep-context-separator-alist)))
 	  (buffer (current-buffer))
 	  (inhibit-read-only t))
 
@@ -262,23 +338,19 @@ N defaults to 1."
 		  (cl-incf (cdr ctx)))))))))
 
     ;; Insert separator before and after this match
-    (when separator
+    (when (grep-context--get-separator)
       (unless (or (and (equal file prev-file) (< prev-line line)
 		       (= (+ prev-line prev-ctx (car ctx) 1) line))
 		  (and (= (car ctx) 0) (or (null prev-ctx) (= prev-ctx 0))))
 	(forward-line (- (car ctx)))
-	(beginning-of-line)
-	(open-line 1)
-	(insert (propertize separator 'grep-context-separator t))
+        (grep-context--insert-separator)
 	(forward-line (1+ (car ctx))))
       (unless (or (and (equal file next-file) (< line next-line)
 		       (= (+ line (cdr ctx) next-ctx 1) next-line))
 		  (and (= (cdr ctx) 0) (or (null next-ctx) (= next-ctx 0))))
 	(save-excursion
 	  (forward-line (1+ (cdr ctx)))
-	  (beginning-of-line)
-	  (open-line 1)
-	  (insert (propertize separator 'grep-context-separator t)))))
+          (grep-context--insert-separator))))
 
     (save-excursion
       (forward-line (1+ (cdr ctx)))
